@@ -28,6 +28,7 @@ import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
+import { time } from "../timings.ts";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -370,18 +371,33 @@ async function loadExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
+	extId: number,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+	const parts = resolvedPath.split(path.sep);
+	const shortPath = parts.length > 2 ? parts.slice(-3).join("/") : parts.slice(-2).join("/");
+	const labelBase = `ext#${extId}[${shortPath}]`;
 
 	try {
+		const t0 = Date.now();
+		time(`${labelBase}.module.start`);
 		const factory = await loadExtensionModule(resolvedPath);
+		time(`${labelBase}.module.end`);
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
+		time(`${labelBase}.factory.start`);
 		await factory(api);
+		time(`${labelBase}.factory.end`);
+		const totalMs = Date.now() - t0;
+		if (totalMs > 500) {
+			console.error(
+				`[SLOW EXTENSION] ${resolvedPath} took ${totalMs}ms (module: ~${totalMs - 10}ms, factory: ~10ms)`,
+			);
+		}
 
 		return { extension, error: null };
 	} catch (err) {
@@ -416,12 +432,20 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
+	let extId = 0;
 
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, resolvedCwd, resolvedEventBus, runtime);
-
+	time("extensions.loadExtensions.start");
+	const results = await Promise.all(
+		paths.map(async (extPath) => {
+			const id = ++extId;
+			const result = await loadExtension(extPath, resolvedCwd, resolvedEventBus, runtime, id);
+			return { ...result, path: extPath };
+		}),
+	);
+	time("extensions.loadExtensions.end");
+	for (const { extension, error, path } of results) {
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path, error });
 			continue;
 		}
 
@@ -555,6 +579,7 @@ export async function discoverAndLoadExtensions(
 	agentDir: string = getAgentDir(),
 	eventBus?: EventBus,
 ): Promise<LoadExtensionsResult> {
+	time("extensions.discoverAndLoad.start");
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedAgentDir = resolvePath(agentDir);
 	const allPaths: string[] = [];
@@ -595,6 +620,7 @@ export async function discoverAndLoadExtensions(
 
 		addPaths([resolved]);
 	}
-
-	return loadExtensions(allPaths, resolvedCwd, eventBus);
+	const result = await loadExtensions(allPaths, resolvedCwd, eventBus);
+	time("extensions.discoverAndLoad.end");
+	return result;
 }

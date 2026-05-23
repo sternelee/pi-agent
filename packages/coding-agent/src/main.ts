@@ -421,7 +421,11 @@ export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
 
-export async function main(args: string[], options?: MainOptions) {
+export async function main(args: string[], options?: MainOptions): Promise<void> {
+	// --startup enables startup timing diagnostics
+	if (args.includes("--startup")) {
+		process.env.PI_TIMING = "1";
+	}
 	resetTimings();
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
@@ -624,6 +628,7 @@ export async function main(args: string[], options?: MainOptions) {
 			.getExtensions()
 			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
 		printHelp(extensionFlags);
+		printTimings();
 		process.exit(0);
 	}
 
