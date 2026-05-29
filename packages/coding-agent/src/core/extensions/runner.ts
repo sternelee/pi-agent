@@ -247,6 +247,8 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	/** Promise that resolves when real extensions are loaded (for lazy loading) */
+	extensionsReadyPromise: Promise<void> | null = null;
 
 	constructor(
 		extensions: Extension[],
@@ -261,6 +263,24 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+	}
+
+	/**
+	 * Replace extensions with real ones (after lazy loading completes).
+	 * Updates the extensions array in-place so all references stay valid.
+	 */
+	replaceExtensions(extensions: Extension[]): void {
+		this.extensions = extensions;
+	}
+
+	/**
+	 * Wait for real extensions to be loaded if lazy loading is in progress.
+	 * Called before tool/command execution.
+	 */
+	async ensureExtensionsLoaded(): Promise<void> {
+		if (this.extensionsReadyPromise) {
+			await this.extensionsReadyPromise;
+		}
 	}
 
 	bindCore(

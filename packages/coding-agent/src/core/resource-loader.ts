@@ -10,7 +10,12 @@ export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
-import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.ts";
+import {
+	createExtensionRuntime,
+	loadExtensionFromFactory,
+	loadExtensions,
+	resetExtensionModuleCache,
+} from "./extensions/loader.ts";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.ts";
 import { DefaultPackageManager, type PathMetadata } from "./package-manager.ts";
 import type { PromptTemplate } from "./prompt-templates.ts";
@@ -320,6 +325,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async reload(): Promise<void> {
+		resetExtensionModuleCache();
 		time("resourceLoader.settingsManager.reload.start");
 		await this.settingsManager.reload();
 		time("resourceLoader.settingsManager.reload.end");

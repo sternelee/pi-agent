@@ -1555,6 +1555,8 @@ export interface LoadExtensionsResult {
 	errors: Array<{ path: string; error: string }>;
 	/** Shared runtime - actions are throwing stubs until runner.initialize() */
 	runtime: ExtensionRuntime;
+	/** Promise that resolves when background loading of real extensions completes (for lazy loading) */
+	backgroundLoadPromise?: Promise<void>;
 }
 
 // ============================================================================

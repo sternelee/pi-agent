@@ -41,6 +41,222 @@ import type {
 	ToolDefinition,
 } from "./types.ts";
 
+// ============================================================================
+// Extension metadata cache for fast startup
+// ============================================================================
+
+interface CachedToolMeta {
+	name: string;
+	description: string;
+	// Serialized JSON Schema for parameters
+	parameters?: unknown;
+	executionMode?: string;
+}
+
+interface CachedCommandMeta {
+	name: string;
+	description?: string;
+}
+
+interface CachedExtensionMeta {
+	path: string;
+	resolvedPath: string;
+	/** SHA-256 hash of the entry file content */
+	hash: string;
+	tools: CachedToolMeta[];
+	commands: CachedCommandMeta[];
+	/** Event types this extension has handlers for */
+	handlerEvents: string[];
+}
+
+interface MetadataCache {
+	version: number;
+	extensions: CachedExtensionMeta[];
+}
+
+const META_CACHE_VERSION = 1;
+
+function getMetaCachePath(): string {
+	return path.join(getAgentDir(), "cache", "ext-metadata.json");
+}
+
+function computeFileHash(filePath: string): string {
+	const crypto = require("node:crypto") as typeof import("node:crypto");
+	// Handle directory paths (some extensions are directories with index.ts)
+	let targetPath = filePath;
+	if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+		const indexTs = path.join(filePath, "index.ts");
+		const indexJs = path.join(filePath, "index.js");
+		if (fs.existsSync(indexTs)) targetPath = indexTs;
+		else if (fs.existsSync(indexJs)) targetPath = indexJs;
+		else return "";
+	}
+	const content = fs.readFileSync(targetPath);
+	return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+/**
+ * Save extension metadata to cache after loading.
+ */
+function saveExtensionMetadata(extensions: Extension[]): void {
+	try {
+		const cachePath = getMetaCachePath();
+		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+
+		const cached: MetadataCache = {
+			version: META_CACHE_VERSION,
+			extensions: extensions.map((ext) => {
+				const hash = computeFileHash(ext.resolvedPath);
+				const tools: CachedToolMeta[] = [];
+				for (const tool of ext.tools.values()) {
+					tools.push({
+						name: tool.definition.name,
+						description: tool.definition.description,
+						parameters: tool.definition.parameters,
+						executionMode: tool.definition.executionMode,
+					});
+				}
+				const commands: CachedCommandMeta[] = [];
+				for (const cmd of ext.commands.values()) {
+					commands.push({
+						name: cmd.name,
+						description: cmd.description,
+					});
+				}
+				return {
+					path: ext.path,
+					resolvedPath: ext.resolvedPath,
+					hash,
+					tools,
+					commands,
+					handlerEvents: Array.from(ext.handlers.keys()),
+				};
+			}),
+		};
+
+		fs.writeFileSync(cachePath, JSON.stringify(cached));
+	} catch {
+		// Cache save failure is non-fatal
+	}
+}
+
+/**
+ * Load extension metadata from cache.
+ * Returns null if cache is missing, outdated, or any extension has changed.
+ */
+function loadExtensionMetadata(paths: string[]): MetadataCache | null {
+	try {
+		const cachePath = getMetaCachePath();
+		if (!fs.existsSync(cachePath)) return null;
+
+		const raw = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as MetadataCache;
+		if (raw.version !== META_CACHE_VERSION) return null;
+
+		// Verify all paths are in cache and hashes match
+		const cachedByPath = new Map(raw.extensions.map((e) => [e.resolvedPath, e]));
+		for (const extPath of paths) {
+			const resolved = resolvePath(extPath);
+			let cached = cachedByPath.get(resolved);
+			if (!cached) {
+				// Try to find by path field as well
+				const cachedByOrigPath = raw.extensions.find((e) => e.path === extPath);
+				if (!cachedByOrigPath) return null;
+				cached = cachedByOrigPath;
+			}
+			// Verify hash
+			try {
+				const currentHash = computeFileHash(resolved);
+				if (currentHash !== cached.hash) return null;
+			} catch {
+				return null;
+			}
+		}
+
+		return raw;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Create a stub extension from cached metadata.
+ * Registers tool/command metadata but no real handlers.
+ */
+function createStubExtension(meta: CachedExtensionMeta): Extension {
+	const extension: Extension = {
+		path: meta.path,
+		resolvedPath: meta.resolvedPath,
+		sourceInfo: createSyntheticSourceInfo(meta.path, { source: "local", baseDir: path.dirname(meta.resolvedPath) }),
+		handlers: new Map(),
+		tools: new Map(),
+		messageRenderers: new Map(),
+		commands: new Map(),
+		flags: new Map(),
+		shortcuts: new Map(),
+	};
+
+	for (const toolMeta of meta.tools) {
+		const toolDef: ToolDefinition = {
+			name: toolMeta.name,
+			label: toolMeta.name,
+			description: toolMeta.description,
+			parameters: (toolMeta.parameters as ToolDefinition["parameters"]) ?? {},
+			executionMode: toolMeta.executionMode as ToolDefinition["executionMode"],
+			execute: async () => {
+				throw new Error(`Extension not loaded yet. Tool "${toolMeta.name}" is waiting for lazy load.`);
+			},
+		};
+		extension.tools.set(toolMeta.name, {
+			definition: toolDef,
+			sourceInfo: extension.sourceInfo,
+		});
+	}
+
+	for (const cmdMeta of meta.commands) {
+		extension.commands.set(cmdMeta.name, {
+			name: cmdMeta.name,
+			description: cmdMeta.description,
+			sourceInfo: extension.sourceInfo,
+			handler: async () => {
+				throw new Error(`Extension not loaded yet. Command "${cmdMeta.name}" is waiting for lazy load.`);
+			},
+		});
+	}
+
+	return extension;
+}
+
+// Track background loading state
+let backgroundLoadPromise: Promise<void> | null = null;
+let stubExtensions: Extension[] | null = null;
+let realExtensions: Extension[] | null = null;
+const _backgroundLoadErrors: { errors: Array<{ path: string; error: string }> } = { errors: [] };
+
+/** Get errors from background extension loading (if any). */
+export function getBackgroundLoadErrors(): Array<{ path: string; error: string }> {
+	return _backgroundLoadErrors.errors;
+}
+
+/**
+ * Wait for real extensions to be loaded.
+ * Called before tool/command execution.
+ */
+export async function waitForExtensionsLoaded(): Promise<Extension[]> {
+	if (realExtensions) return realExtensions;
+	if (backgroundLoadPromise) {
+		await backgroundLoadPromise;
+		return realExtensions!;
+	}
+	return [];
+}
+
+/**
+ * Get current extensions (stubs or real).
+ */
+export function getCurrentExtensions(): Extension[] {
+	return realExtensions ?? stubExtensions ?? [];
+}
+
 /** Modules available to extensions via virtualModules (for compiled Bun binary) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
 	typebox: _bundledTypebox,
@@ -329,15 +545,46 @@ function createExtensionAPI(
 	return api;
 }
 
-async function loadExtensionModule(extensionPath: string) {
-	const jiti = createJiti(import.meta.url, {
-		moduleCache: false,
-		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
-		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
-		// In Node.js/dev: use aliases to resolve to node_modules paths
-		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
-	});
+// Shared jiti instance with module cache enabled. All extensions reuse this,
+// so shared dependencies (pi-ai, pi-tui, typebox, etc.) are compiled once.
+let sharedJiti: ReturnType<typeof createJiti> | undefined;
 
+/** Reset shared jiti cache. Called on /reload so modified extensions are re-imported. */
+export function resetExtensionModuleCache(): void {
+	sharedJiti = undefined;
+	realExtensions = null;
+	stubExtensions = null;
+	backgroundLoadPromise = null;
+	_backgroundLoadErrors.errors = [];
+}
+
+/**
+ * Delete metadata cache file. Called on explicit /reload so modified extensions
+ * are re-discovered. NOT called on initial session creation.
+ */
+export function deleteExtensionMetadataCache(): void {
+	try {
+		const cachePath = getMetaCachePath();
+		if (fs.existsSync(cachePath)) {
+			fs.unlinkSync(cachePath);
+		}
+	} catch {}
+}
+
+function getSharedJiti() {
+	if (!sharedJiti) {
+		const fsCacheDir = path.join(getAgentDir(), "cache", "jiti");
+		sharedJiti = createJiti(import.meta.url, {
+			moduleCache: true,
+			fsCache: fsCacheDir,
+			...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
+		});
+	}
+	return sharedJiti;
+}
+
+async function loadExtensionModule(extensionPath: string) {
+	const jiti = getSharedJiti();
 	const module = await jiti.import(extensionPath, { default: true });
 	const factory = module as ExtensionFactory;
 	return typeof factory !== "function" ? undefined : factory;
@@ -425,16 +672,63 @@ export async function loadExtensionFromFactory(
 
 /**
  * Load extensions from paths.
+ *
+ * Uses metadata cache for fast startup: on cache hit, returns stub extensions
+ * immediately and loads real extensions in the background.
  */
 export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
-	const extensions: Extension[] = [];
-	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
-	let extId = 0;
 
 	time("extensions.loadExtensions.start");
+
+	// Try metadata cache for fast startup
+	const metaCache = loadExtensionMetadata(paths);
+	if (metaCache && metaCache.extensions.length === paths.length) {
+		time("extensions.metadataCache.hit");
+		const stubs = metaCache.extensions.map(createStubExtension);
+		stubExtensions = stubs;
+
+		// Start background loading of real extensions
+		backgroundLoadPromise = (async () => {
+			time("extensions.backgroundLoad.start");
+			const results = await Promise.all(
+				paths.map(async (extPath, idx) => {
+					const result = await loadExtension(extPath, resolvedCwd, resolvedEventBus, runtime, idx + 1);
+					return { ...result, path: extPath };
+				}),
+			);
+			const loaded: Extension[] = [];
+			const errors: Array<{ path: string; error: string }> = [];
+			for (const { extension, error, path } of results) {
+				if (error) {
+					errors.push({ path, error });
+					continue;
+				}
+				if (extension) loaded.push(extension);
+			}
+			realExtensions = loaded;
+			_backgroundLoadErrors.errors = errors;
+			saveExtensionMetadata(loaded);
+			time("extensions.backgroundLoad.end");
+		})();
+
+		return {
+			extensions: stubs,
+			errors: [],
+			runtime,
+			backgroundLoadPromise,
+		};
+	}
+
+	time("extensions.metadataCache.miss");
+
+	// No cache - load normally
+	const extensions: Extension[] = [];
+	const errors: Array<{ path: string; error: string }> = [];
+	let extId = 0;
+
 	const results = await Promise.all(
 		paths.map(async (extPath) => {
 			const id = ++extId;
@@ -453,6 +747,10 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 			extensions.push(extension);
 		}
 	}
+
+	// Save metadata for next startup
+	saveExtensionMetadata(extensions);
+	realExtensions = extensions;
 
 	return {
 		extensions,

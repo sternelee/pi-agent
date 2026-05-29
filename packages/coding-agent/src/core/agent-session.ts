@@ -77,6 +77,7 @@ import {
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
+import { deleteExtensionMetadataCache, getCurrentExtensions } from "./extensions/loader.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
@@ -1094,6 +1095,7 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
+			// Note: extensions may still be loading in background; this will use stubs if needed
 			const result = await this._extensionRunner.emitBeforeAgentStart(
 				expandedText,
 				currentImages,
@@ -1141,6 +1143,9 @@ export class AgentSession {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+
+		// Wait for real extensions if lazy loading is in progress
+		await this._extensionRunner.ensureExtensionsLoaded();
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
@@ -2403,6 +2408,22 @@ export class AgentSession {
 			this.sessionManager,
 			this._modelRegistry,
 		);
+		// Set up lazy loading: when background load completes, swap in real extensions
+		if (extensionsResult.backgroundLoadPromise) {
+			this._extensionRunner.extensionsReadyPromise = extensionsResult.backgroundLoadPromise
+				.then(() => {
+					this._extensionRunner.replaceExtensions(getCurrentExtensions());
+					this._refreshToolRegistry({ includeAllExtensionTools: true });
+				})
+				.catch((err) => {
+					const message = err instanceof Error ? err.message : String(err);
+					this._extensionRunner.emitError({
+						extensionPath: "<lazy-load>",
+						event: "background_load",
+						error: `Background extension loading failed: ${message}`,
+					});
+				});
+		}
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
@@ -2424,6 +2445,8 @@ export class AgentSession {
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
 		resetApiProviders();
+		// Delete metadata cache so extensions are re-discovered
+		deleteExtensionMetadataCache();
 		await this._resourceLoader.reload();
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),
